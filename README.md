@@ -1,0 +1,265 @@
+saerogochim-mvp-v8/
+ ├─ run.bat
+ └─ backend/
+     ├─ requirements.txt
+     ├─ main.py
+     ├─ database.py
+     └─ static/
+         ├─ index.html
+         └─ logo.png   ← 네 로고 이미지 파일
+@echo off
+cd /d %~dp0backend
+if not exist .venv (
+  python -m venv .venv
+)
+call .\.venv\Scripts\activate
+pip install --upgrade pip >NUL 2>&1
+pip install -r requirements.txt >NUL 2>&1
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+fastapi==0.115.0
+uvicorn==0.30.6
+sqlmodel==0.0.22
+pydantic==2.9.2
+python-multipart
+python-docx
+pymupdf
+reportlab
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from typing import Optional
+from datetime import datetime
+import os
+
+DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./serogochim.db")
+connect_args = {"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
+engine = create_engine(DB_URL, echo=False, connect_args=connect_args)
+
+class Contractor(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    city: str = "수원"
+    category: str = "아파트"
+    rating: float = 0.0
+    reviews_count: int = 0
+    is_verified: bool = False
+    biz_reg_no: Optional[str] = None
+    contact_name: Optional[str] = None
+    phone: Optional[str] = None
+    avg_budget: Optional[int] = None
+    regions: Optional[str] = None
+    tags: Optional[str] = None
+
+class Review(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    contractor_id: int = Field(index=True, foreign_key="contractor.id")
+    rating: int
+    text: str
+    receipt_number: str
+    receipt_date: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class PartnerApplication(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    company: str
+    contact_name: str
+    phone: str
+    region: Optional[str] = None
+    category: Optional[str] = None
+    avg_monthly_jobs: Optional[int] = None
+    message: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+def init_db():
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        exists = session.exec(select(Contractor)).first()
+        if not exists:
+            contractors = [
+                Contractor(name="가우디자인", city="수원", category="주거", rating=4.6, reviews_count=12, is_verified=True, tags="아파트,주거", regions="수원,용인", contact_name="이원춘", phone="010-0000-0000"),
+                Contractor(name="큐브디자인", city="광교", category="사무실", rating=4.5, reviews_count=7, is_verified=False, tags="사무실,상가", regions="수원,동탄", contact_name="김큐브", phone="010-1111-1111"),
+                Contractor(name="중앙인테리어", city="수원", category="주거", rating=4.1, reviews_count=5, is_verified=False, tags="아파트,욕실", regions="수원", contact_name="편혁", phone="010-2222-2222"),
+            ]
+            for c in contractors:
+                session.add(c)
+            session.commit()
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from sqlmodel import Session, select
+from typing import List, Optional
+from pydantic import BaseModel, Field
+import re, io, os, fitz, docx
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from database import engine, init_db, Contractor, Review, PartnerApplication
+
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "seroadmin")
+
+app = FastAPI(title="새로고침 MVP v8", version="0.9.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+class ContractorOut(BaseModel):
+    id:int; name:str; city:str; category:str; rating:float; reviews_count:int; is_verified:bool
+    biz_reg_no:Optional[str]=None; contact_name:Optional[str]=None; phone:Optional[str]=None
+    avg_budget:Optional[int]=None; regions:Optional[str]=None; tags:Optional[str]=None
+
+class ContractorIn(BaseModel):
+    name:str; city:Optional[str]="수원"; category:Optional[str]="아파트"; is_verified:Optional[bool]=False
+    biz_reg_no:Optional[str]=None; contact_name:Optional[str]=None; phone:Optional[str]=None
+    avg_budget:Optional[int]=None; regions:Optional[str]=None; tags:Optional[str]=None
+
+class ReviewIn(BaseModel):
+    contractor_id:int; rating:int=Field(ge=1,le=5); text:str
+    receipt_number:str; receipt_date:Optional[str]=None
+
+class ReviewOut(BaseModel):
+    id:int; contractor_id:int; rating:int; text:str
+
+class PartnerApplyIn(BaseModel):
+    company:str; contact_name:str; phone:str
+    region:Optional[str]=None; category:Optional[str]=None
+    avg_monthly_jobs:Optional[int]=None; message:Optional[str]=None
+
+class PartnerApplyOut(BaseModel):
+    id:int; company:str; contact_name:str; phone:str
+    region:Optional[str]=None; category:Optional[str]=None
+    avg_monthly_jobs:Optional[int]=None; message:Optional[str]=None
+
+RISKY_TERMS=["선금 전액","현금만","추가비용 무제한","책임지지","하자보수 제외","계약서 미작성"]
+FIX_MAP={
+ "선금 전액":"총 계약금의 10~20%만 선금, 잔금은 단계별 지급",
+ "하자보수 제외":"공사 완료 후 최소 1년간 무상 하자보수 포함",
+ "계약서 미작성":"공사 범위, 기간, 금액, 책임사항 포함한 표준계약서 작성",
+ "현금만":"현금 외 계좌이체/카드 허용, 세금계산서 발행",
+ "추가비용 무제한":"추가비용 상한(예: 총액의 10%)·사전 합의 절차 명시",
+ "책임지지":"하자보수·지연배상 등 책임 범위 명확히"
+}
+
+@app.on_event("startup")
+def on_startup(): init_db()
+@app.get("/api/contractors", response_model=List[ContractorOut])
+def list_contractors(query:Optional[str]=None, city:Optional[str]=None, category:Optional[str]=None,
+                     tag:Optional[str]=None, region:Optional[str]=None, min_rating:Optional[float]=None):
+    with Session(engine) as s:
+        rows=s.exec(select(Contractor)).all()
+        def ok(c):
+            cond=True
+            if query: cond &= any(query in (x or "") for x in [c.name,c.category,c.city,c.tags,c.regions])
+            if city: cond&=(c.city==city)
+            if category: cond&=(c.category==category)
+            if tag: cond&=(c.tags and tag in c.tags)
+            if region: cond&=(c.regions and region in c.regions)
+            if min_rating: cond&=(c.rating>=min_rating)
+            return cond
+        return [ContractorOut(**c.dict()) for c in rows if ok(c)]
+
+def check_admin(key:Optional[str]): 
+    if key!=ADMIN_KEY: raise HTTPException(401,"관리자 키 오류")
+
+@app.post("/api/admin/contractors", response_model=ContractorOut, status_code=201)
+def create_ctr(p:ContractorIn, x_admin_key:Optional[str]=Header(None)):
+    check_admin(x_admin_key)
+    with Session(engine) as s:
+        row=Contractor(**p.dict()); s.add(row); s.commit(); s.refresh(row); return ContractorOut(**row.dict())
+
+@app.put("/api/admin/contractors/{cid}", response_model=ContractorOut)
+def update_ctr(cid:int, p:ContractorIn, x_admin_key:Optional[str]=Header(None)):
+    check_admin(x_admin_key)
+    with Session(engine) as s:
+        row=s.get(Contractor,cid)
+        if not row: raise HTTPException(404,"없음")
+        for k,v in p.dict().items(): setattr(row,k,v)
+        s.add(row); s.commit(); s.refresh(row); return ContractorOut(**row.dict())
+
+@app.delete("/api/admin/contractors/{cid}")
+def del_ctr(cid:int, x_admin_key:Optional[str]=Header(None)):
+    check_admin(x_admin_key)
+    with Session(engine) as s:
+        row=s.get(Contractor,cid); 
+        if not row: raise HTTPException(404,"없음")
+        s.delete(row); s.commit(); return {"ok":True}
+
+@app.post("/api/reviews", response_model=ReviewOut, status_code=201)
+def create_review(p:ReviewIn):
+    if not re.fullmatch(r"[0-9]{10,14}", p.receipt_number or ""):
+        raise HTTPException(400,"영수증 번호 형식 오류")
+    with Session(engine) as s:
+        ctr=s.get(Contractor,p.contractor_id)
+        if not ctr: raise HTTPException(404,"업체 없음")
+        dup=s.exec(select(Review).where(Review.contractor_id==p.contractor_id).where(Review.receipt_number==p.receipt_number)).first()
+        if dup: raise HTTPException(400,"이미 등록됨")
+        r=Review(**p.dict()); s.add(r)
+        ctr.reviews_count+=1
+        ctr.rating=round(((ctr.rating*(ctr.reviews_count-1))+p.rating)/ctr.reviews_count,2)
+        s.add(ctr); s.commit(); s.refresh(r); return ReviewOut(id=r.id,contractor_id=r.contractor_id,rating=r.rating,text=r.text)
+
+class ContractCheckResult(BaseModel): risks:List[str]; score:int; message:str
+def extract_text(fn:str,data:bytes)->str:
+    if fn.lower().endswith(".docx"):
+        d=docx.Document(io.BytesIO(data)); return "\n".join(p.text for p in d.paragraphs)
+    elif fn.lower().endswith(".pdf"):
+        t=""; 
+        with fitz.open(stream=data,filetype="pdf") as pdf:
+            for pg in pdf: t+=pg.get_text()
+        return t
+    else: return data.decode("utf-8","ignore")
+
+@app.post("/api/contracts/validate",response_model=ContractCheckResult)
+async def validate(file:UploadFile=File(...)):
+    d=await file.read(); t=extract_text(file.filename,d)
+    found=[term for term in RISKY_TERMS if term in t]; score=max(0,100-len(found)*15)
+    return ContractCheckResult(risks=found,score=score,message=("위험 없음" if not found else "위험 발견"))
+
+@app.post("/api/contracts/fix")
+async def fix(file:UploadFile=File(...)):
+    d=await file.read(); t=extract_text(file.filename,d)
+    found=[term for term in RISKY_TERMS if term in t]; fixes=[FIX_MAP[f] for f in found if f in FIX_MAP]
+    path=f"static/fixed_{os.path.basename(file.filename)}.pdf"
+    buf=io.BytesIO(); c=canvas.Canvas(buf,pagesize=A4)
+    c.setFont("Helvetica-Bold",16); c.drawString(50,800,"보완된 계약서 (샘플)")
+    y=770; c.setFont("Helvetica",10)
+    for line in t.splitlines():
+        if not line.strip(): continue
+        c.drawString(50,y,line[:90]); y-=12
+        if y<120: c.showPage(); c.setFont("Helvetica",10); y=800
+    c.showPage(); c.setFont("Helvetica-Bold",14); c.drawString(50,800,"보완 문구 제안"); c.setFont("Helvetica",11); y=770
+    for fx in fixes: c.drawString(50,y,"- "+fx); y-=16
+    if not fixes: c.drawString(50,y,"위험 문구 없음")
+    c.save(); buf.seek(0)
+    with open(path,"wb") as f: f.write(buf.getvalue())
+    return {"risks":found,"fixes":fixes,"fixed_pdf":"/"+path}
+
+@app.post("/api/partner/apply",response_model=PartnerApplyOut,status_code=201)
+def partner_apply(p:PartnerApplyIn):
+    with Session(engine) as s:
+        row=PartnerApplication(**p.dict()); s.add(row); s.commit(); s.refresh(row); return PartnerApplyOut(**row.dict())
+
+@app.get("/api/partner/apply",response_model=List[PartnerApplyOut])
+def list_app(): 
+    with Session(engine) as s: 
+        rows=s.exec(select(PartnerApplication).order_by(PartnerApplication.created_at.desc())).all()
+        return [PartnerApplyOut(**r.dict()) for r in rows]
+
+@app.get("/health")
+def health(): return {"ok":True}
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>새로고침 MVP v8</title>
+<!-- CSS랑 탭 UI는 이전 버전 그대로 두고 -->
+...
+<footer style="margin-top:40px;padding:18px 0;border-top:1px solid #e6e6e6;font-size:14px;color:#444;display:flex;gap:16px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+  <div>ⓒ 2025 새로고침. All Rights Reserved.</div>
+  <div>
+    <a href="mailto:tlghkdbstjd@naver.com" style="margin-right:12px;text-decoration:none;color:#0e2a3f">✉︎ tlghkdbstjd@naver.com</a>
+    <a href="tel:+821062308923" style="text-decoration:none;color:#0e2a3f">☎ 010-6230-8923</a>
+  </div>
+</footer>
+</body>
+</html>
